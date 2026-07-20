@@ -189,7 +189,7 @@ impl Drop for WGPUDeviceImpl {
             // pre v27 this would wait for 60 seconds instead of waiting indefinitely
             match context.device_poll(self.id, wgt::PollType::wait_indefinitely()) {
                 Ok(_) => (),
-                Err(err) => handle_error_fatal(err, "WGPUDeviceImpl::drop"),
+                Err(err) => handle_error_fatal(&self.error_sink, err, "WGPUDeviceImpl::drop"),
             }
 
             context.device_drop(self.id);
@@ -374,7 +374,7 @@ impl Drop for WGPUTextureImpl {
             if !self.has_surface_presented.load(atomic::Ordering::SeqCst) {
                 match self.context.surface_texture_discard(surface_id) {
                     Ok(_) => (),
-                    Err(cause) => handle_error_fatal(cause, "wgpuTextureRelease"),
+                    Err(cause) => handle_error_fatal(&self.error_sink, cause, "wgpuTextureRelease"),
                 }
             }
         }
@@ -599,10 +599,11 @@ fn format_error(err: &(impl error::Error + 'static)) -> String {
 }
 
 fn handle_error_fatal(
+    sink_mutex: &Mutex<ErrorSinkRaw>,
     cause: impl error::Error + Send + Sync + 'static,
     operation: &'static str,
-) -> ! {
-    panic!("Error in {operation}: {f}", f = format_error(&cause));
+) {
+    handle_error(sink_mutex, cause, None, operation);
 }
 
 fn handle_error(
@@ -958,9 +959,9 @@ pub unsafe extern "C" fn wgpuBufferGetConstMappedRange(
     offset: usize,
     size: usize,
 ) -> *const u8 {
-    let (buffer_id, context) = {
+    let (buffer_id, context, error_sink) = {
         let buffer = buffer.as_ref().expect("invalid buffer");
-        (buffer.id, &buffer.context)
+        (buffer.id, &buffer.context, &buffer.error_sink)
     };
 
     let buf = match context.buffer_get_mapped_range(
@@ -972,7 +973,10 @@ pub unsafe extern "C" fn wgpuBufferGetConstMappedRange(
         },
     ) {
         Ok((ptr, _)) => ptr,
-        Err(err) => handle_error_fatal(err, "wgpuBufferGetConstMappedRange"),
+        Err(err) => {
+            handle_error_fatal(error_sink, err, "wgpuBufferGetConstMappedRange");
+            return std::ptr::null();
+        }
     };
 
     buf.as_ptr()
@@ -984,9 +988,9 @@ pub unsafe extern "C" fn wgpuBufferGetMappedRange(
     offset: usize,
     size: usize,
 ) -> *mut u8 {
-    let (buffer_id, context) = {
+    let (buffer_id, context, error_sink) = {
         let buffer = buffer.as_ref().expect("invalid buffer");
-        (buffer.id, &buffer.context)
+        (buffer.id, &buffer.context, &buffer.error_sink)
     };
 
     let buf = match context.buffer_get_mapped_range(
@@ -998,7 +1002,10 @@ pub unsafe extern "C" fn wgpuBufferGetMappedRange(
         },
     ) {
         Ok((ptr, _)) => ptr,
-        Err(err) => handle_error_fatal(err, "wgpuBufferGetMappedRange"),
+        Err(err) => {
+            handle_error_fatal(error_sink, err, "wgpuBufferGetMappedRange");
+            return std::ptr::null_mut();
+        }
     };
 
     buf.as_ptr()
@@ -2170,9 +2177,9 @@ pub unsafe extern "C" fn wgpuDeviceCreateRenderBundleEncoder(
     device: native::WGPUDevice,
     descriptor: Option<&native::WGPURenderBundleEncoderDescriptor>,
 ) -> native::WGPURenderBundleEncoder {
-    let (device_id, context) = {
+    let (device_id, context, error_sink) = {
         let device = device.as_ref().expect("invalid device");
-        (device.id, &device.context)
+        (device.id, &device.context, &device.error_sink)
     };
     let descriptor = descriptor.expect("invalid descriptor");
 
@@ -2199,7 +2206,8 @@ pub unsafe extern "C" fn wgpuDeviceCreateRenderBundleEncoder(
             encoder: Box::into_raw(Box::new(Some(Box::into_raw(Box::new(encoder))))),
         })),
         Err(cause) => {
-            handle_error_fatal(cause, "wgpuDeviceCreateRenderBundleEncoder");
+            handle_error_fatal(error_sink, cause, "wgpuDeviceCreateRenderBundleEncoder");
+            std::ptr::null()
         }
     }
 }
@@ -2808,21 +2816,21 @@ pub unsafe extern "C" fn wgpuInstanceCreateSurface(
         CreateSurfaceParams::Raw((rdh, rwh)) => {
             match context.instance_create_surface(Some(rdh), rwh, None) {
                 Ok(surface_id) => surface_id,
-                Err(cause) => handle_error_fatal(cause, "wgpuInstanceCreateSurface"),
+                Err(_cause) => return std::ptr::null(),
             }
         }
         #[cfg(all(any(target_os = "ios", target_os = "macos"), feature = "metal"))]
         CreateSurfaceParams::Metal(layer) => {
             match context.instance_create_surface_metal(layer, None) {
                 Ok(surface_id) => surface_id,
-                Err(cause) => handle_error_fatal(cause, "wgpuInstanceCreateSurface"),
+                Err(_cause) => return std::ptr::null(),
             }
         }
         #[cfg(all(target_os = "windows", feature = "dx12"))]
         CreateSurfaceParams::SwapChainPanel(panel) => {
             match context.instance_create_surface_from_swap_chain_panel(panel, None) {
                 Ok(surface_id) => surface_id,
-                Err(cause) => handle_error_fatal(cause, "wgpuInstanceCreateSurface"),
+                Err(_cause) => return std::ptr::null(),
             }
         }
     };
@@ -2842,9 +2850,7 @@ pub unsafe extern "C" fn wgpuInstanceProcessEvents(instance: native::WGPUInstanc
 
     match context.poll_all_devices(false) {
         Ok(_queue_empty) => (),
-        Err(cause) => {
-            handle_error_fatal(cause, "wgpuInstanceProcessEvents");
-        }
+        Err(_cause) => (),
     }
 }
 
@@ -3075,9 +3081,9 @@ pub unsafe extern "C" fn wgpuQueueSubmit(
     command_count: usize,
     commands: *const native::WGPUCommandBuffer,
 ) {
-    let (queue_id, context) = {
+    let (queue_id, context, error_sink) = {
         let queue = queue.as_ref().expect("invalid queue");
-        (queue.queue.id, &queue.queue.context)
+        (queue.queue.id, &queue.queue.context, &queue.error_sink)
     };
 
     let command_buffers = make_slice(commands, command_count)
@@ -3090,7 +3096,7 @@ pub unsafe extern "C" fn wgpuQueueSubmit(
         .collect::<SmallVec<[_; 4]>>();
 
     if let Err(cause) = context.queue_submit(queue_id, &command_buffers) {
-        handle_error_fatal(cause.1, "wgpuQueueSubmit");
+        handle_error_fatal(error_sink, cause.1, "wgpuQueueSubmit");
     }
 }
 
@@ -3306,8 +3312,8 @@ pub unsafe extern "C" fn wgpuRenderBundleEncoderFinish(
     };
 
     let (render_bundle_id, error) = context.render_bundle_encoder_finish(*encoder, &desc, None);
-    if let Some(cause) = error {
-        handle_error_fatal(cause, "wgpuRenderBundleEncoderFinish");
+    if let Some(_cause) = error {
+        return std::ptr::null();
     }
 
     Arc::into_raw(Arc::new(WGPURenderBundleImpl {
@@ -4054,7 +4060,7 @@ pub unsafe extern "C" fn wgpuSurfaceConfigure(
     ));
 
     match context.surface_configure(surface.id, device.id, &surface_config) {
-        Some(cause) => handle_error_fatal(cause, "wgpuSurfaceConfigure"),
+        Some(cause) => handle_error_fatal(&device.error_sink, cause, "wgpuSurfaceConfigure"),
         None => {
             let mut surface_data_guard = surface.data.lock();
             *surface_data_guard = Some(SurfaceData {
@@ -4169,13 +4175,13 @@ pub unsafe extern "C" fn wgpuSurfaceGetCurrentTexture(
     let context = &surface.context;
     let surface_texture = surface_texture.expect("invalid return pointer \"surface_texture\"");
 
+    surface_texture.status = native::WGPUSurfaceGetCurrentTextureStatus_Error;
+    surface_texture.texture = std::ptr::null_mut();
+
     let surface_data_guard = surface.data.lock();
     let surface_data = match surface_data_guard.as_ref() {
         Some(surface_data) => surface_data,
-        None => handle_error_fatal(
-            wgc::present::SurfaceError::NotConfigured,
-            "wgpuSurfaceGetCurrentTexture",
-        ),
+        None => return,
     };
 
     match context.surface_get_current_texture(surface.id, None) {
@@ -4211,7 +4217,18 @@ pub unsafe extern "C" fn wgpuSurfaceGetCurrentTexture(
                 None => std::ptr::null_mut(),
             };
         }
-        Err(cause) => handle_error_fatal(cause, "wgpuSurfaceGetCurrentTexture"),
+        Err(cause) => {
+            handle_error_fatal(
+                &surface_data.error_sink,
+                cause,
+                "wgpuSurfaceGetCurrentTexture",
+            );
+            surface
+                .has_surface_presented
+                .store(false, atomic::Ordering::SeqCst);
+            surface_texture.status = native::WGPUSurfaceGetCurrentTextureStatus_Error;
+            surface_texture.texture = std::ptr::null_mut();
+        }
     };
 }
 
@@ -4463,9 +4480,9 @@ pub unsafe extern "C" fn wgpuQueueSubmitForIndex(
     command_count: usize,
     commands: *const native::WGPUCommandBuffer,
 ) -> native::WGPUSubmissionIndex {
-    let (queue_id, context) = {
+    let (queue_id, context, error_sink) = {
         let queue = queue.as_ref().expect("invalid queue");
-        (queue.queue.id, &queue.queue.context)
+        (queue.queue.id, &queue.queue.context, &queue.error_sink)
     };
 
     let command_buffers = make_slice(commands, command_count)
@@ -4479,7 +4496,10 @@ pub unsafe extern "C" fn wgpuQueueSubmitForIndex(
 
     match context.queue_submit(queue_id, &command_buffers) {
         Ok(submission_index) => submission_index,
-        Err(cause) => handle_error_fatal(cause.1, "wgpuQueueSubmitForIndex"),
+        Err(cause) => {
+            handle_error_fatal(error_sink, cause.1, "wgpuQueueSubmitForIndex");
+            0
+        }
     }
 }
 
@@ -4490,9 +4510,9 @@ pub unsafe extern "C" fn wgpuDevicePoll(
     wait: bool,
     submission_index: Option<&native::WGPUSubmissionIndex>,
 ) -> bool {
-    let (device_id, context) = {
+    let (device_id, context, error_sink) = {
         let device = device.as_ref().expect("invalid device");
-        (device.id, &device.context)
+        (device.id, &device.context, &device.error_sink)
     };
 
     let maintain = match wait {
@@ -4510,7 +4530,8 @@ pub unsafe extern "C" fn wgpuDevicePoll(
         Ok(wgt::PollStatus::QueueEmpty) => true,
         Ok(_) => false,
         Err(cause) => {
-            handle_error_fatal(cause, "wgpuDevicePoll");
+            handle_error_fatal(error_sink, cause, "wgpuDevicePoll");
+            false
         }
     }
 }
